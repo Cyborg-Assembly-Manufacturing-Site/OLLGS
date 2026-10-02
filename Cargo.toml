@@ -1,0 +1,13 @@
+[package]
+name = "ollgs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bzip2 = "0.6.1"
+sha1 = "0.11.0"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
