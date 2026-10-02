@@ -14,7 +14,14 @@ pub const WORD_TYPES: &[&str] = &[
     "Diacritical mark", "Letter", "Ligature", "Number", "Punctuation mark", "Syllable", "Symbol",
     "Phrase", "Proverb", "Prepositional phrase",
     "Han character", "Hanzi", "Kanji", "Hanja", "Romanization",
+    // Older heading still found on some pages, shown by Wiktionary like any word type.
+    "Idiom",
 ];
+
+/// The word type a heading names, matched without regard to capitals ("Proper Noun").
+fn word_type(heading: &str) -> Option<&'static str> {
+    WORD_TYPES.iter().copied().find(|t| t.eq_ignore_ascii_case(heading))
+}
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Meaning {
@@ -32,7 +39,7 @@ pub struct WordTypeBlock {
 /// What the extractor saw besides meanings, for checking the extraction against the data.
 #[derive(Default, Debug)]
 pub struct Oddities {
-    /// Headings that had meaning-shaped lines under them but are not word types.
+    /// Headings that had meaning-shaped lines under them but are not word types, once per section.
     pub skipped_headings_with_meanings: Vec<String>,
     /// Meaning-shaped lines under no heading at all.
     pub orphan_meaning_lines: usize,
@@ -117,14 +124,16 @@ pub fn english_meanings(page_text: &str, odd: &mut Oddities) -> Vec<WordTypeBloc
     let Some(lines) = english_lines(&text) else { return Vec::new() };
 
     let mut blocks: Vec<WordTypeBlock> = Vec::new();
-    // None before any heading; Some(None) under a heading that is not a word type.
-    let mut current: Option<Option<String>> = None;
+    // None before any heading; Some(Err(name)) under a heading that is not a word type.
+    let mut current: Option<Result<&str, &str>> = None;
+    let mut skipped_recorded = false;
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
         i += 1;
         if let Some((_, name)) = heading(line) {
-            current = Some(WORD_TYPES.contains(&name).then(|| name.to_string()));
+            current = Some(word_type(name).ok_or(name));
+            skipped_recorded = false;
             continue;
         }
         let Some((depth, first)) = meaning_line(line) else { continue };
@@ -137,17 +146,17 @@ pub fn english_meanings(page_text: &str, odd: &mut Oddities) -> Vec<WordTypeBloc
             balance = brace_balance(&text);
             i += 1;
         }
-        match &current {
-            Some(Some(word_type)) => {
-                if blocks.last().is_none_or(|b| &b.word_type != word_type) {
-                    blocks.push(WordTypeBlock { word_type: word_type.clone(), meanings: Vec::new() });
+        match current {
+            Some(Ok(word_type)) => {
+                if blocks.last().is_none_or(|b| b.word_type != word_type) {
+                    blocks.push(WordTypeBlock { word_type: word_type.to_string(), meanings: Vec::new() });
                 }
                 blocks.last_mut().unwrap().meanings.push(Meaning { depth, text });
             }
-            Some(None) => {
-                let (_, name) = lines[..i].iter().rev().find_map(|l| heading(l)).unwrap();
-                if odd.skipped_headings_with_meanings.last().map(String::as_str) != Some(name) {
+            Some(Err(name)) => {
+                if !skipped_recorded {
                     odd.skipped_headings_with_meanings.push(name.to_string());
+                    skipped_recorded = true;
                 }
             }
             None => odd.orphan_meaning_lines += 1,
@@ -226,9 +235,17 @@ From {{m|en|use}}.
     #[test]
     fn records_meaning_lines_under_other_headings() {
         let mut odd = Oddities::default();
-        let blocks = english_meanings("==English==\n===Usage notes===\n# a numbered note\n# another\n", &mut odd);
-        assert!(blocks.is_empty());
-        assert_eq!(odd.skipped_headings_with_meanings, vec!["Usage notes".to_string()]);
+        let page = "==English==\n===Usage notes===\n# a note\n# another\n===Etymology===\n# x\n===Usage notes===\n# again\n";
+        assert!(english_meanings(page, &mut odd).is_empty());
+        assert_eq!(odd.skipped_headings_with_meanings, ["Usage notes", "Etymology", "Usage notes"]);
+    }
+
+    #[test]
+    fn word_type_headings_ignore_capitals() {
+        let mut odd = Oddities::default();
+        let blocks = english_meanings("==English==\n===Proper Noun===\n# A name.\n====Idiom====\n# A saying.\n", &mut odd);
+        let types: Vec<&str> = blocks.iter().map(|b| b.word_type.as_str()).collect();
+        assert_eq!(types, ["Proper noun", "Idiom"]);
     }
 
     #[test]

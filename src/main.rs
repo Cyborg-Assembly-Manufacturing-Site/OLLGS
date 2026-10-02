@@ -1,9 +1,11 @@
+mod bz2par;
 mod cache;
 mod dump;
 mod wikitext;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::{mpsc, Mutex};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -41,6 +43,71 @@ fn main() -> ExitCode {
     }
 }
 
+/// Pages per batch handed to an extraction worker.
+const BATCH: usize = 512;
+
+/// What one batch of pages yields, in page order.
+#[derive(Default)]
+struct Batch {
+    entries: Vec<(String, Vec<wikitext::WordTypeBlock>)>,
+    redirects: Vec<(String, String)>,
+    odd: wikitext::Oddities,
+}
+
+fn extract_batch(pages: Vec<dump::Page>) -> std::io::Result<Batch> {
+    let english = memchr::memmem::Finder::new(b"English");
+    let mut out = Batch::default();
+    for page in pages {
+        if let Some(target) = page.redirect {
+            out.redirects.push((page.title, target));
+            continue;
+        }
+        // Most pages have no English section; skip them before unescaping.
+        if english.find(&page.escaped_text).is_none() {
+            continue;
+        }
+        let text = std::str::from_utf8(&page.escaped_text)
+            .map_err(|_| std::io::Error::other(format!("page {:?} is not UTF-8", page.title)))?;
+        let blocks = wikitext::english_meanings(&dump::unescape(text), &mut out.odd);
+        if !blocks.is_empty() {
+            out.entries.push((page.title, blocks));
+        }
+    }
+    Ok(out)
+}
+
+struct Written {
+    writer: cache::Writer,
+    english: u64,
+    meanings: u64,
+    odd: wikitext::Oddities,
+}
+
+fn write_batches(mut writer: cache::Writer, done: mpsc::Receiver<(usize, std::io::Result<Batch>)>) -> std::io::Result<Written> {
+    let mut pending = BTreeMap::new();
+    let mut next = 0;
+    let (mut english, mut meanings) = (0, 0);
+    let mut odd = wikitext::Oddities::default();
+    for (i, batch) in done {
+        pending.insert(i, batch);
+        while let Some(batch) = pending.remove(&next) {
+            let batch = batch?;
+            for (title, blocks) in &batch.entries {
+                writer.entry(title, blocks)?;
+                english += 1;
+                meanings += blocks.iter().map(|b| b.meanings.len() as u64).sum::<u64>();
+            }
+            for (from, to) in batch.redirects {
+                writer.redirect(from, to);
+            }
+            odd.skipped_headings_with_meanings.extend(batch.odd.skipped_headings_with_meanings);
+            odd.orphan_meaning_lines += batch.odd.orphan_meaning_lines;
+            next += 1;
+        }
+    }
+    Ok(Written { writer, english, meanings, odd })
+}
+
 fn extract() -> std::io::Result<()> {
     let dir = data_dir();
     let dump_path = dir.join(DUMP_FILE);
@@ -48,33 +115,52 @@ fn extract() -> std::io::Result<()> {
     let tmp_path = dir.join(format!("{CACHE_FILE}.partial"));
     let started = Instant::now();
 
-    let mut writer = cache::Writer::create(&tmp_path)?;
-    let mut odd = wikitext::Oddities::default();
-    let mut english = 0u64;
-    let mut meanings = 0u64;
-    let mut write_err = None;
+    let writer = cache::Writer::create(&tmp_path)?;
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
 
-    let (stats, sha1) = dump::for_each_page(&dump_path, |page| {
-        if write_err.is_some() {
-            return;
+    // The reader hands pages out in numbered batches; workers extract meanings on
+    // all cores; the writer puts batches back in dump order, so the cache is the
+    // same on every run.
+    let (work_tx, work_rx) = mpsc::sync_channel::<(usize, Vec<dump::Page>)>(threads * 2);
+    let work_rx = Mutex::new(work_rx);
+    let (done_tx, done_rx) = mpsc::channel::<(usize, std::io::Result<Batch>)>();
+
+    let (read, written) = std::thread::scope(|s| {
+        for _ in 0..threads {
+            let (work_rx, done_tx) = (&work_rx, done_tx.clone());
+            s.spawn(move || {
+                // After the writer stops (on an error), keep draining so the reader never blocks.
+                let mut writer_alive = true;
+                loop {
+                    let next = work_rx.lock().unwrap().recv();
+                    let Ok((i, pages)) = next else { break };
+                    if writer_alive && done_tx.send((i, extract_batch(pages))).is_err() {
+                        writer_alive = false;
+                    }
+                }
+            });
         }
-        if let Some(target) = page.redirect {
-            writer.redirect(page.title, target);
-            return;
+        drop(done_tx);
+        let writer = s.spawn(move || write_batches(writer, done_rx));
+
+        let mut batch = Vec::with_capacity(BATCH);
+        let mut n = 0;
+        let read = dump::for_each_page(&dump_path, |page| {
+            batch.push(page);
+            if batch.len() == BATCH {
+                let full = std::mem::replace(&mut batch, Vec::with_capacity(BATCH));
+                let _ = work_tx.send((n, full));
+                n += 1;
+            }
+        });
+        if !batch.is_empty() {
+            let _ = work_tx.send((n, batch));
         }
-        let blocks = wikitext::english_meanings(&page.text, &mut odd);
-        if blocks.is_empty() {
-            return;
-        }
-        english += 1;
-        meanings += blocks.iter().map(|b| b.meanings.len() as u64).sum::<u64>();
-        if let Err(e) = writer.entry(&page.title, &blocks) {
-            write_err = Some(e);
-        }
-    })?;
-    if let Some(e) = write_err {
-        return Err(e);
-    }
+        drop(work_tx);
+        (read, writer.join().expect("writer thread panicked"))
+    });
+    let (stats, sha1) = read?;
+    let Written { writer, english, meanings, odd } = written?;
     if sha1 != DUMP_SHA1 {
         std::fs::remove_file(&tmp_path)?;
         return Err(std::io::Error::other(format!(

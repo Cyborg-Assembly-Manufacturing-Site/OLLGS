@@ -5,20 +5,17 @@
 //! values, so a line scanner is enough and much cheaper than a full XML parser.
 //! Anything that breaks that layout is reported as an error, not skipped.
 
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead};
 use std::path::Path;
-use std::sync::mpsc;
-use std::thread;
 
-use bzip2::read::MultiBzDecoder;
-use sha1::{Digest, Sha1};
+use crate::bz2par::ParallelDecoder;
 
-/// One main-namespace page. Pages in other namespaces are counted but never copied.
+/// One main-namespace page, its text still XML-escaped so the caller can
+/// unescape it on another thread.
 pub struct Page {
     pub title: String,
     pub redirect: Option<String>,
-    pub text: String,
+    pub escaped_text: Vec<u8>,
 }
 
 #[derive(Default, Debug)]
@@ -29,134 +26,37 @@ pub struct DumpStats {
     pub decompressed_bytes: u64,
 }
 
-const CHUNK: usize = 4 << 20;
-
-/// Reads the file, hashes the compressed bytes with SHA-1 and decompresses on a
-/// separate thread, so hashing and decompression overlap with page scanning.
-struct Decompressor {
-    rx: mpsc::Receiver<io::Result<Vec<u8>>>,
-    cur: Vec<u8>,
-    pos: usize,
-    handle: Option<thread::JoinHandle<(String, u64)>>,
-}
-
-struct HashingReader<R> {
-    inner: R,
-    hasher: Sha1,
-    bytes: u64,
-}
-
-impl<R: Read> Read for HashingReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.hasher.update(&buf[..n]);
-        self.bytes += n as u64;
-        Ok(n)
-    }
-}
-
-impl Decompressor {
-    fn open(path: &Path) -> io::Result<Self> {
-        let file = File::open(path)?;
-        let (tx, rx) = mpsc::sync_channel(8);
-        let handle = thread::spawn(move || {
-            let hashing = HashingReader { inner: BufReader::with_capacity(1 << 20, file), hasher: Sha1::new(), bytes: 0 };
-            let mut dec = MultiBzDecoder::new(hashing);
-            loop {
-                let mut chunk = vec![0u8; CHUNK];
-                let mut filled = 0;
-                while filled < CHUNK {
-                    match dec.read(&mut chunk[filled..]) {
-                        Ok(0) => break,
-                        Ok(n) => filled += n,
-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                        Err(e) => {
-                            let _ = tx.send(Err(e));
-                            return (String::new(), 0);
-                        }
-                    }
-                }
-                chunk.truncate(filled);
-                let done = filled < CHUNK;
-                if filled > 0 && tx.send(Ok(chunk)).is_err() {
-                    return (String::new(), 0);
-                }
-                if done {
-                    break;
-                }
-            }
-            // Drain anything after the last stream so the hash covers the whole file.
-            let mut hashing = dec.into_inner();
-            let _ = io::copy(&mut hashing, &mut io::sink());
-            let digest = hashing.hasher.finalize();
-            let hex = digest.iter().map(|b| format!("{b:02x}")).collect();
-            (hex, hashing.bytes)
-        });
-        Ok(Decompressor { rx, cur: Vec::new(), pos: 0, handle: Some(handle) })
-    }
-
-    /// Waits for the reading thread and returns the SHA-1 of the compressed file and its size.
-    fn finish(&mut self) -> (String, u64) {
-        self.handle.take().map(|h| h.join().expect("decompression thread panicked")).unwrap_or_default()
-    }
-}
-
-impl Read for Decompressor {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let avail = self.fill_buf()?;
-        let n = avail.len().min(buf.len());
-        buf[..n].copy_from_slice(&avail[..n]);
-        self.consume(n);
-        Ok(n)
-    }
-}
-
-impl BufRead for Decompressor {
-    fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        while self.pos >= self.cur.len() {
-            match self.rx.recv() {
-                Ok(Ok(chunk)) => {
-                    self.cur = chunk;
-                    self.pos = 0;
-                }
-                Ok(Err(e)) => return Err(e),
-                Err(_) => return Ok(&[]),
-            }
-        }
-        Ok(&self.cur[self.pos..])
-    }
-
-    fn consume(&mut self, amt: usize) {
-        self.pos += amt;
-    }
-}
-
 fn bad(line_no: u64, what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("dump line {line_no}: {what}"))
 }
 
-fn between<'a>(line: &'a str, open: &str, close: &str) -> Option<&'a str> {
+fn between<'a>(line: &'a [u8], open: &[u8], close: &[u8]) -> Option<&'a [u8]> {
     line.strip_prefix(open)?.strip_suffix(close)
+}
+
+fn text(bytes: &[u8], line_no: u64) -> io::Result<String> {
+    std::str::from_utf8(bytes).map(unescape).map_err(|_| bad(line_no, "not UTF-8"))
 }
 
 /// Calls `f` for every main-namespace page, in dump order. Returns the stats and
 /// the SHA-1 (hex) of the compressed file as actually read.
 pub fn for_each_page(path: &Path, mut f: impl FnMut(Page)) -> io::Result<(DumpStats, String)> {
-    let mut src = Decompressor::open(path)?;
+    let mut src = ParallelDecoder::open(path)?;
     let mut stats = DumpStats::default();
-    let mut line = String::new();
+    let close_text = memchr::memmem::Finder::new(b"</text>");
+    let mut line = Vec::with_capacity(1 << 16);
     let mut line_no = 0u64;
 
     let mut in_page = false;
-    let mut title: Option<String> = None;
+    let mut title: Option<Vec<u8>> = None;
     let mut ns: Option<i64> = None;
-    let mut redirect: Option<String> = None;
-    let mut text: Option<String> = None;
+    let mut redirect: Option<Vec<u8>> = None;
+    let mut body: Vec<u8> = Vec::new();
     let mut in_text = false;
 
     loop {
         line.clear();
-        let n = src.read_line(&mut line)?;
+        let n = src.read_until(b'\n', &mut line)?;
         if n == 0 {
             break;
         }
@@ -164,25 +64,16 @@ pub fn for_each_page(path: &Path, mut f: impl FnMut(Page)) -> io::Result<(DumpSt
         stats.decompressed_bytes += n as u64;
 
         if in_text {
-            let keep = ns == Some(0);
-            match line.find("</text>") {
-                Some(end) => {
-                    if keep {
-                        text.get_or_insert_with(String::new).push_str(&line[..end]);
-                    }
-                    in_text = false;
-                }
-                None => {
-                    if keep {
-                        text.get_or_insert_with(String::new).push_str(&line);
-                    }
-                }
+            let end = close_text.find(&line);
+            if ns == Some(0) {
+                body.extend_from_slice(&line[..end.unwrap_or(line.len())]);
             }
+            in_text = end.is_none();
             continue;
         }
 
-        let t = line.trim();
-        if t == "<page>" {
+        let t = line.trim_ascii();
+        if t == b"<page>" {
             if in_page {
                 return Err(bad(line_no, "<page> inside a page"));
             }
@@ -190,49 +81,38 @@ pub fn for_each_page(path: &Path, mut f: impl FnMut(Page)) -> io::Result<(DumpSt
             title = None;
             ns = None;
             redirect = None;
-            text = None;
+            body.clear();
         } else if !in_page {
             continue;
-        } else if let Some(v) = between(t, "<title>", "</title>") {
-            title = Some(unescape(v));
-        } else if let Some(v) = between(t, "<ns>", "</ns>") {
-            ns = Some(v.parse().map_err(|_| bad(line_no, "unreadable <ns>"))?);
-        } else if let Some(v) = between(t, "<redirect title=\"", "\" />") {
-            redirect = Some(unescape(v));
-        } else if t.starts_with("<text") {
-            let keep = ns == Some(0);
-            let open_end = t.find('>').ok_or_else(|| bad(line_no, "unclosed <text> tag"))?;
-            if t[..=open_end].ends_with("/>") {
-                // Empty or deleted text.
-                if keep {
-                    text = Some(String::new());
-                }
-                continue;
+        } else if let Some(v) = between(t, b"<title>", b"</title>") {
+            title = Some(v.to_vec());
+        } else if let Some(v) = between(t, b"<ns>", b"</ns>") {
+            let v = std::str::from_utf8(v).ok().and_then(|v| v.parse().ok());
+            ns = Some(v.ok_or_else(|| bad(line_no, "unreadable <ns>"))?);
+        } else if let Some(v) = between(t, b"<redirect title=\"", b"\" />") {
+            redirect = Some(v.to_vec());
+        } else if t.starts_with(b"<text") {
+            let open_end = memchr::memchr(b'>', &line).ok_or_else(|| bad(line_no, "unclosed <text> tag"))?;
+            if line[..open_end].ends_with(b"/") {
+                continue; // empty or deleted text
             }
-            // Content starts after the opening tag in the untrimmed line.
-            let tag_at = line.find("<text").unwrap();
-            let rest = &line[tag_at + line[tag_at..].find('>').unwrap() + 1..];
-            match rest.find("</text>") {
-                Some(end) => {
-                    if keep {
-                        text = Some(rest[..end].to_string());
-                    }
-                }
-                None => {
-                    if keep {
-                        text = Some(rest.to_string());
-                    }
-                    in_text = true;
-                }
+            let rest = &line[open_end + 1..];
+            let end = close_text.find(rest);
+            if ns == Some(0) {
+                body.extend_from_slice(&rest[..end.unwrap_or(rest.len())]);
             }
-        } else if t == "</page>" {
+            in_text = end.is_none();
+        } else if t == b"</page>" {
             in_page = false;
             stats.pages += 1;
             if ns == Some(0) {
                 stats.main_pages += 1;
                 let title = title.take().ok_or_else(|| bad(line_no, "page without <title>"))?;
-                let raw = text.take().unwrap_or_default();
-                f(Page { title, redirect: redirect.take(), text: unescape(&raw) });
+                f(Page {
+                    title: text(&title, line_no)?,
+                    redirect: redirect.take().map(|r| text(&r, line_no)).transpose()?,
+                    escaped_text: std::mem::take(&mut body),
+                });
             }
         }
     }
@@ -302,6 +182,7 @@ mod tests {
     #[test]
     fn reads_main_namespace_pages_and_hash() {
         use bzip2::write::BzEncoder;
+        use sha1::{Digest, Sha1};
         use std::io::Write;
 
         let xml = "<mediawiki>\n  <page>\n    <title>Wiktionary:About</title>\n    <ns>4</ns>\n    <revision>\n      <text bytes=\"5\" xml:space=\"preserve\">==English==\n# &lt;no&gt;</text>\n    </revision>\n  </page>\n  <page>\n    <title>caf&#233; &amp; co</title>\n    <ns>0</ns>\n    <revision>\n      <text bytes=\"30\" xml:space=\"preserve\">==English==\n===Noun===\n# A &lt;b&gt;place&lt;/b&gt;.\n</text>\n    </revision>\n  </page>\n  <page>\n    <title>colour</title>\n    <ns>0</ns>\n    <redirect title=\"color\" />\n    <revision>\n      <text bytes=\"20\" xml:space=\"preserve\">#REDIRECT [[color]]</text>\n    </revision>\n  </page>\n  <page>\n    <title>empty</title>\n    <ns>0</ns>\n    <revision>\n      <text bytes=\"0\" />\n    </revision>\n  </page>\n</mediawiki>\n";
@@ -312,7 +193,7 @@ mod tests {
         std::fs::write(&path, &compressed).unwrap();
 
         let mut pages = Vec::new();
-        let (stats, sha1) = for_each_page(&path, |p| pages.push((p.title, p.redirect, p.text))).unwrap();
+        let (stats, sha1) = for_each_page(&path, |p| pages.push((p.title, p.redirect, unescape(std::str::from_utf8(&p.escaped_text).unwrap())))).unwrap();
         std::fs::remove_file(&path).unwrap();
 
         let expected_sha1: String = Sha1::digest(&compressed).iter().map(|b| format!("{b:02x}")).collect();

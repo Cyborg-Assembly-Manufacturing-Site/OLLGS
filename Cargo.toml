@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 bzip2 = "0.6.1"
+memchr = "2.8.3"
+memmap2 = "0.9.11"
 sha1 = "0.11.0"
 
 [profile.release]
