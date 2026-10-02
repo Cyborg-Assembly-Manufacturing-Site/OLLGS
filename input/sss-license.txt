@@ -1,0 +1,18 @@
+The SSS License (Soclets Standard Software)
+
+Credit: [the owner's credit words]
+
+Definitions
+
+[definitions]
+
+Conditions
+
+1. This license applies wherever the software is used: in public or in private, in open-source or closed-source work.
+2. People may use, copy, change, share and sell the software, as long as they follow this license.
+3. The original shall be credited, using the credit words chosen by its owner:
+   - in open-source work, in the source code;
+   - in closed-source work, where its users can see it, such as an About screen or the documentation;
+   - in private work, in the work's own files.
+4. There are no warranties.
+5. A copy of this license that leaves out any part of it, including any of its definitions, is not this license.
