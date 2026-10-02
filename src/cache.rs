@@ -1,5 +1,6 @@
 //! The extracted dictionary on disk: every English entry's meanings as raw wikitext,
-//! plus main-namespace redirects, stamped with the SHA-1 of the dump it came from.
+//! main-namespace redirects, and the template and module pages that say how
+//! Wiktionary displays that wikitext, stamped with the SHA-1 of the dump it came from.
 //!
 //! Layout: magic, dump SHA-1 (40 hex bytes), entries, redirects, end marker.
 //! Strings are a little-endian u32 length followed by UTF-8 bytes.
@@ -11,13 +12,20 @@ use std::path::Path;
 
 use crate::wikitext::{Meaning, WordTypeBlock};
 
-const MAGIC: &[u8; 8] = b"OLLGSDC1";
+const MAGIC: &[u8; 8] = b"OLLGSDC2";
 const END: &[u8; 8] = b"OLLGSEND";
+
+/// A template or module page, by full title ("Template:lb", "Module:labels/data").
+pub struct WikiPage {
+    pub redirect: Option<String>,
+    pub text: String,
+}
 
 pub struct Dictionary {
     pub dump_sha1: String,
     pub entries: HashMap<String, Vec<WordTypeBlock>>,
     pub redirects: HashMap<String, String>,
+    pub pages: HashMap<String, WikiPage>,
 }
 
 pub struct Writer {
@@ -52,6 +60,13 @@ impl Writer {
         }
         self.entries += 1;
         Ok(())
+    }
+
+    pub fn page(&mut self, title: &str, redirect: Option<&str>, text: &str) -> io::Result<()> {
+        self.out.write_all(&[3])?;
+        put_str(&mut self.out, title)?;
+        put_str(&mut self.out, redirect.unwrap_or(""))?;
+        put_str(&mut self.out, text)
     }
 
     pub fn redirect(&mut self, from: String, to: String) {
@@ -107,6 +122,7 @@ pub fn read(path: &Path) -> io::Result<Dictionary> {
     }
     let mut entries = HashMap::new();
     let mut redirects = HashMap::new();
+    let mut pages = HashMap::new();
     loop {
         match r.bytes::<1>()?[0] {
             1 => {
@@ -131,6 +147,11 @@ pub fn read(path: &Path) -> io::Result<Dictionary> {
                 let from = r.string()?;
                 redirects.insert(from, r.string()?);
             }
+            3 => {
+                let title = r.string()?;
+                let redirect = Some(r.string()?).filter(|t| !t.is_empty());
+                pages.insert(title, WikiPage { redirect, text: r.string()? });
+            }
             0 => break,
             _ => return Err(bad("corrupt record")),
         }
@@ -140,5 +161,5 @@ pub fn read(path: &Path) -> io::Result<Dictionary> {
     if &r.bytes::<8>()? != END || count != entries.len() as u64 {
         return Err(bad("incomplete or corrupt (no end marker or wrong entry count)"));
     }
-    Ok(Dictionary { dump_sha1, entries, redirects })
+    Ok(Dictionary { dump_sha1, entries, redirects, pages })
 }

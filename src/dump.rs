@@ -10,9 +10,14 @@ use std::path::Path;
 
 use crate::bz2par::ParallelDecoder;
 
-/// One main-namespace page, its text still XML-escaped so the caller can
-/// unescape it on another thread.
+/// Namespaces whose pages are passed on: entries, templates and Lua modules
+/// (the last two say how Wiktionary displays the markup inside entries).
+pub const KEPT_NAMESPACES: [i64; 3] = [0, 10, 828];
+
+/// One page from a kept namespace, its text still XML-escaped so the caller
+/// can unescape it on another thread.
 pub struct Page {
+    pub ns: i64,
     pub title: String,
     pub redirect: Option<String>,
     pub escaped_text: Vec<u8>,
@@ -38,7 +43,7 @@ fn text(bytes: &[u8], line_no: u64) -> io::Result<String> {
     std::str::from_utf8(bytes).map(unescape).map_err(|_| bad(line_no, "not UTF-8"))
 }
 
-/// Calls `f` for every main-namespace page, in dump order. Returns the stats and
+/// Calls `f` for every page in a kept namespace, in dump order. Returns the stats and
 /// the SHA-1 (hex) of the compressed file as actually read.
 pub fn for_each_page(path: &Path, mut f: impl FnMut(Page)) -> io::Result<(DumpStats, String)> {
     let mut src = ParallelDecoder::open(path)?;
@@ -53,6 +58,7 @@ pub fn for_each_page(path: &Path, mut f: impl FnMut(Page)) -> io::Result<(DumpSt
     let mut redirect: Option<Vec<u8>> = None;
     let mut body: Vec<u8> = Vec::new();
     let mut in_text = false;
+    let mut kept = false;
 
     loop {
         line.clear();
@@ -65,7 +71,7 @@ pub fn for_each_page(path: &Path, mut f: impl FnMut(Page)) -> io::Result<(DumpSt
 
         if in_text {
             let end = close_text.find(&line);
-            if ns == Some(0) {
+            if kept {
                 body.extend_from_slice(&line[..end.unwrap_or(line.len())]);
             }
             in_text = end.is_none();
@@ -80,6 +86,7 @@ pub fn for_each_page(path: &Path, mut f: impl FnMut(Page)) -> io::Result<(DumpSt
             in_page = true;
             title = None;
             ns = None;
+            kept = false;
             redirect = None;
             body.clear();
         } else if !in_page {
@@ -89,6 +96,7 @@ pub fn for_each_page(path: &Path, mut f: impl FnMut(Page)) -> io::Result<(DumpSt
         } else if let Some(v) = between(t, b"<ns>", b"</ns>") {
             let v = std::str::from_utf8(v).ok().and_then(|v| v.parse().ok());
             ns = Some(v.ok_or_else(|| bad(line_no, "unreadable <ns>"))?);
+            kept = ns.is_some_and(|n| KEPT_NAMESPACES.contains(&n));
         } else if let Some(v) = between(t, b"<redirect title=\"", b"\" />") {
             redirect = Some(v.to_vec());
         } else if t.starts_with(b"<text") {
@@ -98,17 +106,18 @@ pub fn for_each_page(path: &Path, mut f: impl FnMut(Page)) -> io::Result<(DumpSt
             }
             let rest = &line[open_end + 1..];
             let end = close_text.find(rest);
-            if ns == Some(0) {
+            if kept {
                 body.extend_from_slice(&rest[..end.unwrap_or(rest.len())]);
             }
             in_text = end.is_none();
         } else if t == b"</page>" {
             in_page = false;
             stats.pages += 1;
-            if ns == Some(0) {
-                stats.main_pages += 1;
+            stats.main_pages += (ns == Some(0)) as u64;
+            if kept {
                 let title = title.take().ok_or_else(|| bad(line_no, "page without <title>"))?;
                 f(Page {
+                    ns: ns.unwrap(),
                     title: text(&title, line_no)?,
                     redirect: redirect.take().map(|r| text(&r, line_no)).transpose()?,
                     escaped_text: std::mem::take(&mut body),
